@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>家庭麻將記帳助手 (雲端版)</title>
+    <!-- React & Dependencies -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        window.FirebaseSDK = { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, doc, setDoc, onSnapshot, updateDoc, collection };
+    </script>
+
+    <style>
+        body { -webkit-tap-highlight-color: transparent; }
+        .shadow-up { box-shadow: 0 -4px 10px -1px rgb(0 0 0 / 0.05); }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo, useEffect } = React;
+
+        /**
+         * 安全的圖標組件，避免 Lucide 直接操作 DOM 造成 React 崩潰
+         */
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const [iconData, setIconData] = useState(null);
+
+            useEffect(() => {
+                if (window.lucide && window.lucide.icons && window.lucide.icons[name]) {
+                    setIconData(window.lucide.icons[name]);
+                }
+            }, [name]);
+
+            if (!iconData) return <div style={{ width: size, height: size }} className={className} />;
+
+            const [tag, attrs, children] = iconData;
+            return (
+                <svg
+                    width={size}
+                    height={size}
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className={className}
+                    {...attrs}
+                >
+                    {children.map((child, index) => {
+                        const [childTag, childAttrs] = child;
+                        const Component = childTag;
+                        return <Component key={index} {...childAttrs} />;
+                    })}
+                </svg>
+            );
+        };
+
+        const WINDS = ["東", "南", "西", "北"];
+        const ROUND_NAMES = ["一", "二", "三", "四"];
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [roomID, setRoomID] = useState("");
+            const [isEntered, setIsEntered] = useState(false);
+            const [loading, setLoading] = useState(true);
+            const [showSummary, setShowSummary] = useState(false); // 修復：定義漏掉的狀態
+
+            // 遊戲資料狀態
+            const [gameState, setGameState] = useState({
+                players: ["玩家1", "玩家2", "玩家3", "玩家4"],
+                hostName: "場主",
+                startingDealer: 0,
+                config: { base: 30, tai: 10, useDongQian: true },
+                status: { wind: 0, round: 0, dealerIndex: 0, lianCount: 0 },
+                history: [],
+                isSetupMode: true
+            });
+
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'mahjong-family';
+
+            // 1. 初始化 Firebase 與 身份驗證
+            useEffect(() => {
+                const initFirebase = async () => {
+                    const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } = window.FirebaseSDK;
+                    const firebaseConfig = JSON.parse(__firebase_config);
+                    const app = initializeApp(firebaseConfig);
+                    const auth = getAuth(app);
+                    
+                    const authenticate = async () => {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    };
+                    
+                    await authenticate();
+                    
+                    const unsubscribe = onAuthStateChanged(auth, (u) => {
+                        setUser(u);
+                        setLoading(false);
+                    });
+                    return unsubscribe;
+                };
+                
+                let unsubscribe;
+                initFirebase().then(unsub => unsubscribe = unsub);
+                return () => unsubscribe && unsubscribe();
+            }, []);
+
+            // 2. 監聽 Firestore 房間資料
+            useEffect(() => {
+                if (!user || !isEntered || !roomID) return;
+                const { getFirestore, doc, onSnapshot } = window.FirebaseSDK;
+                const db = getFirestore();
+                
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
+                
+                const unsubscribe = onSnapshot(docRef, (snapshot) => {
+                    if (snapshot.exists()) {
+                        setGameState(snapshot.data());
+                    } else {
+                        saveToCloud(gameState);
+                    }
+                }, (error) => {
+                    console.error("Firestore Error:", error);
+                });
+
+                return () => unsubscribe();
+            }, [user, isEntered, roomID]);
+
+            const saveToCloud = async (newData) => {
+                if (!user || !roomID) return;
+                const { getFirestore, doc, setDoc } = window.FirebaseSDK;
+                const db = getFirestore();
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomID);
+                try {
+                    await setDoc(docRef, newData);
+                } catch (e) {
+                    console.error("Save Error:", e);
+                }
+            };
+
+            const totals = useMemo(() => {
+                const scores = [0, 0, 0, 0];
+                let hostTotal = 0;
+                gameState.history.forEach(round => {
+                    round.scores.forEach((s, i) => scores[i] += s);
+                    if (round.dongQianAmount) hostTotal += round.dongQianAmount;
+                });
+                return { scores, hostTotal };
+            }, [gameState.history]);
+
+            // --- 遊戲邏輯控制 ---
+            const handleStartGame = () => {
+                const updated = {
+                    ...gameState,
+                    status: { wind: 0, round: 0, dealerIndex: gameState.startingDealer, lianCount: 0 },
+                    isSetupMode: false
+                };
+                saveToCloud(updated);
+            };
+
+            const addRound = (result) => {
+                let roundScores = [0, 0, 0, 0];
+                let dongQianAmount = 0;
+
+                if (result.type === 'win') {
+                    const amount = gameState.config.base + (result.tai * gameState.config.tai);
+                    roundScores[result.winner] += amount;
+                    roundScores[result.loser] -= amount;
+                } else if (result.type === 'selfDraw') {
+                    const amountPerPerson = gameState.config.base + (result.tai * gameState.config.tai);
+                    roundScores[result.winner] += (amountPerPerson * 3);
+                    gameState.players.forEach((_, i) => { if (i !== result.winner) roundScores[i] -= amountPerPerson; });
+                    if (gameState.config.useDongQian) {
+                        roundScores[result.winner] -= gameState.config.base;
+                        dongQianAmount = gameState.config.base;
+                    }
+                }
+
+                const newHistory = [{ 
+                    id: Date.now(), 
+                    wind: gameState.status.wind, 
+                    dealer: gameState.status.dealerIndex, 
+                    lian: gameState.status.lianCount, 
+                    ...result, 
+                    scores: roundScores, 
+                    dongQianAmount 
+                }, ...gameState.history];
+
+                let nextStatus = { ...gameState.status };
+                if ((result.type !== 'draw' && result.winner === gameState.status.dealerIndex) || result.type === 'draw') {
+                    nextStatus.lianCount += 1;
+                } else {
+                    nextStatus.lianCount = 0;
+                    nextStatus.dealerIndex = (gameState.status.dealerIndex + 1) % 4;
+                    if (nextStatus.dealerIndex === gameState.startingDealer) {
+                        nextStatus.wind = (gameState.status.wind + 1) % 4;
+                    }
+                }
+
+                saveToCloud({ ...gameState, history: newHistory, status: nextStatus });
+            };
+
+            const undoLastRound = () => {
+                if (gameState.history.length === 0) return;
+                const last = gameState.history[0];
+                const updatedHistory = gameState.history.slice(1);
+                saveToCloud({
+                    ...gameState,
+                    history: updatedHistory,
+                    status: { wind: last.wind, dealerIndex: last.dealer, lianCount: last.lian }
+                });
+            };
+
+            const resetGame = () => {
+                if (confirm("確定要清除雲端所有紀錄嗎？")) {
+                    saveToCloud({ ...gameState, history: [], isSetupMode: true });
+                }
+            };
+
+            // --- 畫面渲染 ---
+            if (loading) return <div className="h-screen flex items-center justify-center text-slate-400">載入雲端系統...</div>;
+
+            if (!isEntered) {
+                return (
+                    <div className="p-8 h-screen flex flex-col items-center justify-center space-y-6 max-w-md mx-auto">
+                        <div className="text-center">
+                            <Icon name="cloud" size={60} className="mx-auto text-blue-500 mb-2" />
+                            <h1 className="text-2xl font-bold">進入雲端記帳房</h1>
+                            <p className="text-sm text-slate-500">輸入相同的房間名即可多人同步</p>
+                        </div>
+                        <input 
+                            className="w-full p-4 border rounded-2xl text-center text-xl font-bold focus:ring-2 focus:ring-blue-400 outline-none transition-all"
+                            placeholder="房間名稱 (例: 林家麻將)"
+                            value={roomID}
+                            onChange={e => setRoomID(e.target.value)}
+                        />
+                        <button 
+                            disabled={!roomID}
+                            onClick={() => setIsEntered(true)}
+                            className="w-full bg-blue-600 text-white py-4 rounded-2xl font-bold shadow-lg disabled:opacity-50 active:scale-95 transition-all"
+                        >
+                            進入/建立房間
+                        </button>
+                    </div>
+                );
+            }
+
+            if (gameState.isSetupMode) {
+                return (
+                    <div className="p-4 space-y-6 max-w-md mx-auto pb-20">
+                        <div className="flex justify-between items-center">
+                            <h1 className="text-2xl font-bold text-red-700">🀄️ 設定戰局</h1>
+                            <span className="bg-blue-100 text-blue-700 text-[10px] px-2 py-1 rounded-full font-bold">房: {roomID}</span>
+                        </div>
+                        <div className="bg-orange-50 rounded-2xl border border-orange-200 p-4 space-y-3 shadow-sm">
+                            <label className="text-xs font-bold text-orange-800 flex items-center gap-1"><Icon name="crown" size={14}/>場主 (收東錢)</label>
+                            <input className="w-full bg-white border border-orange-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-orange-500" value={gameState.hostName} onChange={e=>saveToCloud({...gameState, hostName: e.target.value})} />
+                        </div>
+                        <div className="bg-white rounded-2xl border p-4 space-y-4 shadow-sm">
+                            <h2 className="font-semibold text-sm flex items-center gap-1"><Icon name="users" size={16}/>打牌玩家</h2>
+                            {gameState.players.map((name, i) => (
+                                <div key={i} className="flex items-center gap-2">
+                                    <input className="flex-1 border-b py-1 text-sm focus:outline-none focus:border-red-500" value={name} onChange={e=>{const n=[...gameState.players]; n[i]=e.target.value; saveToCloud({...gameState, players:n});}} />
+                                    <button onClick={()=>saveToCloud({...gameState, startingDealer:i})} className={`px-2 py-1 rounded-lg border text-[10px] transition-colors ${gameState.startingDealer===i?'bg-yellow-100 border-yellow-500 font-bold text-yellow-700':'bg-gray-50 text-slate-400'}`}>
+                                        {gameState.startingDealer===i?'起莊':'設起莊'}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="bg-white p-3 rounded-2xl border"><label className="text-[10px] text-gray-400 font-bold">底錢</label><input type="number" className="w-full font-bold focus:outline-none" value={gameState.config.base} onChange={e=>saveToCloud({...gameState, config:{...gameState.config, base:parseInt(e.target.value)||0}})} /></div>
+                            <div className="bg-white p-3 rounded-2xl border"><label className="text-[10px] text-gray-400 font-bold">台錢</label><input type="number" className="w-full font-bold focus:outline-none" value={gameState.config.tai} onChange={e=>saveToCloud({...gameState, config:{...gameState.config, tai:parseInt(e.target.value)||0}})} /></div>
+                        </div>
+                        <div className="bg-white p-4 rounded-2xl border flex justify-between items-center">
+                            <div className="text-sm font-medium">東錢規則 (自摸給底)</div>
+                            <input type="checkbox" className="w-6 h-6 accent-red-600" checked={gameState.config.useDongQian} onChange={e=>saveToCloud({...gameState, config:{...gameState.config, useDongQian:e.target.checked}})} />
+                        </div>
+                        <button onClick={handleStartGame} className="w-full bg-red-600 text-white font-bold py-4 rounded-2xl shadow-lg active:scale-95 transition-all">進入牌局</button>
+                        <button onClick={() => setIsEntered(false)} className="w-full text-slate-400 text-sm py-2 hover:text-slate-600 transition-colors">更換房間</button>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="pb-32">
+                    <div className="bg-red-700 text-white p-4 sticky top-0 z-10 shadow-md flex justify-between items-end">
+                        <div>
+                            <div className="text-xs opacity-80">風向</div>
+                            <div className="text-2xl font-black">{WINDS[gameState.status.wind]}風 {gameState.status.lianCount > 0 && `連 ${gameState.status.lianCount}`}</div>
+                        </div>
+                        <div className="text-right">
+                            <div className="text-xs opacity-80">莊家</div>
+                            <div className="font-bold flex items-center justify-end gap-1">
+                                <Icon name="star" size={14} className="text-yellow-400 fill-yellow-400" />
+                                {gameState.players[gameState.status.dealerIndex]}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div className="p-4 space-y-4 max-w-md mx-auto">
+                        <div className="grid grid-cols-4 gap-2">
+                            {gameState.players.map((name, i) => (
+                                <div key={i} className={`p-2 rounded-xl text-center border transition-all ${gameState.status.dealerIndex===i?'bg-yellow-50 border-yellow-400 ring-1 ring-yellow-400':'bg-white border-slate-100'}`}>
+                                    <div className="text-[10px] text-gray-400 truncate font-medium">{name}</div>
+                                    <div className={`font-bold ${totals.scores[i]>=0?'text-red-600':'text-blue-600'}`}>{totals.scores[i]}</div>
+                                </div>
+                            ))}
+                        </div>
+
+                        <ActionPanel addRound={addRound} players={gameState.players} />
+
+                        <div className="flex justify-between items-center px-1">
+                            <span className="font-bold text-sm flex items-center gap-1 text-slate-600"><Icon name="history" size={14}/>雲端歷史紀錄</span>
+                            <button onClick={undoLastRound} className="text-xs text-blue-600 font-bold active:opacity-50">撤銷上把</button>
+                        </div>
+                        
+                        <div className="space-y-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-1">
+                            {gameState.history.length === 0 ? (
+                                <div className="text-center py-10 text-slate-300 italic text-sm border-2 border-dashed rounded-2xl">尚無戰報資料</div>
+                            ) : (
+                                gameState.history.map(h => (
+                                    <div key={h.id} className="bg-white p-3 rounded-xl border flex gap-3 shadow-sm text-xs border-slate-100">
+                                        <div className="w-10 h-10 bg-slate-50 flex flex-col items-center justify-center rounded border font-bold text-slate-500 shrink-0">
+                                            <span>{WINDS[h.wind]}</span>
+                                            <span className="text-[8px]">{h.lian>0?`L${h.lian}`:'平'}</span>
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <div className="font-bold text-slate-700 truncate">
+                                                {h.type==='draw' ? (
+                                                    <span className="text-slate-400 italic">流局</span>
+                                                ) : (
+                                                    <>
+                                                        <span className="text-red-600">{gameState.players[h.winner]}</span> 
+                                                        {h.type==='win'?' 胡 ':' 自摸 '} 
+                                                        {h.type==='win' ? <span className="text-blue-600">{gameState.players[h.loser]}</span> : ''}
+                                                        <span className="text-slate-400 ml-1 font-normal">({h.tai}台)</span>
+                                                    </>
+                                                )}
+                                            </div>
+                                            <div className="flex gap-1 mt-1 flex-wrap">
+                                                {h.scores.map((s, idx) => s!==0 && (
+                                                    <span key={idx} className={`px-1.5 py-0.5 rounded text-[9px] font-mono ${s>0?'bg-red-50 text-red-600 border border-red-100':'bg-blue-50 text-blue-600 border border-blue-100'}`}>
+                                                        {gameState.players[idx].substring(0,2)}:{s>0?`+${s}`:s}
+                                                    </span>
+                                                ))}
+                                                {h.dongQianAmount > 0 && <span className="bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded text-[9px] font-bold border border-orange-200">東:{h.dongQianAmount}</span>}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="fixed bottom-0 left-0 right-0 bg-white border-t p-4 flex justify-around shadow-up z-20">
+                        <button onClick={()=>setShowSummary(true)} className="flex flex-col items-center gap-1 text-slate-500 active:text-red-600 transition-colors"><Icon name="trophy"/><span className="text-[10px] font-bold">結算</span></button>
+                        <button onClick={()=>saveToCloud({...gameState, isSetupMode:true})} className="flex flex-col items-center gap-1 text-slate-500 active:text-blue-600 transition-colors"><Icon name="settings"/><span className="text-[10px] font-bold">設定</span></button>
+                        <button onClick={resetGame} className="flex flex-col items-center gap-1 text-red-400 active:text-red-700 transition-colors"><Icon name="trash-2"/><span className="text-[10px] font-bold">清除</span></button>
+                    </div>
+
+                    {showSummary && <SummaryModal players={gameState.players} totals={totals} hostName={gameState.hostName} onClose={()=>setShowSummary(false)} />}
+                </div>
+            );
+        };
+
+        const ActionPanel = ({ addRound, players }) => {
+            const [entry, setEntry] = useState({ type: 'win', winner: 0, loser: 1, tai: 0 });
+            return (
+                <div className="bg-white rounded-2xl p-4 shadow-sm border space-y-4">
+                    <div className="flex bg-gray-100 p-1 rounded-xl">
+                        {['win', 'selfDraw', 'draw'].map(t => (
+                            <button key={t} onClick={()=>setEntry({...entry, type:t})} className={`flex-1 py-2 rounded-lg text-sm font-bold transition-all ${entry.type===t?'bg-white shadow text-red-600':'text-gray-500'}`}>
+                                {t==='win'?'胡牌':t==='selfDraw'?'自摸':'流局'}
+                            </button>
+                        ))}
+                    </div>
+                    {entry.type !== 'draw' && (
+                        <div className="space-y-4">
+                            <div className="space-y-1">
+                                <label className="text-[10px] text-gray-400 font-bold uppercase ml-1">贏家 (收錢)</label>
+                                <div className="grid grid-cols-4 gap-1">
+                                    {players.map((n, i) => <button key={i} onClick={()=>setEntry({...entry, winner:i})} className={`py-2 border rounded-lg text-[10px] truncate px-1 transition-all ${entry.winner===i?'bg-red-50 border-red-500 text-red-700 font-bold ring-1 ring-red-500':'bg-white'}`}>{n}</button>)}
+                                </div>
+                            </div>
+                            {entry.type === 'win' && (
+                                <div className="space-y-1">
+                                    <label className="text-[10px] text-gray-400 font-bold uppercase ml-1">放槍 (付錢)</label>
+                                    <div className="grid grid-cols-4 gap-1">
+                                        {players.map((n, i) => <button key={i} disabled={entry.winner===i} onClick={()=>setEntry({...entry, loser:i})} className={`py-2 border rounded-lg text-[10px] truncate px-1 transition-all ${entry.loser===i?'bg-blue-50 border-blue-500 text-blue-700 font-bold ring-1 ring-blue-500':'bg-white disabled:opacity-20'}`}>{n}</button>)}
+                                    </div>
+                                </div>
+                            )}
+                            <div className="flex justify-between items-center px-2 pt-2 border-t">
+                                <span className="text-sm font-bold">總台數</span>
+                                <div className="flex items-center gap-4">
+                                    <button onClick={()=>setEntry({...entry, tai:Math.max(0,entry.tai-1)})} className="p-2 bg-gray-100 rounded-full active:bg-gray-200"><Icon name="minus" size={16}/></button>
+                                    <span className="text-2xl font-black font-mono w-8 text-center">{entry.tai}</span>
+                                    <button onClick={()=>setEntry({...entry, tai:entry.tai+1})} className="p-2 bg-gray-100 rounded-full active:bg-gray-200"><Icon name="plus" size={16}/></button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    <button onClick={()=>{if(entry.type==='win'&&entry.winner===entry.loser)return; addRound(entry); setEntry({...entry, tai:0});}} className="w-full bg-slate-800 text-white py-4 rounded-xl font-bold active:scale-95 transition-transform shadow-lg">紀錄戰報</button>
+                </div>
+            );
+        };
+
+        const SummaryModal = ({ players, totals, hostName, onClose }) => (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+                <div className="bg-white rounded-3xl w-full max-w-sm overflow-hidden animate-in zoom-in-95 duration-200 shadow-2xl">
+                    <div className="bg-red-600 p-6 text-white text-center relative">
+                        <button onClick={onClose} className="absolute top-4 right-4 bg-white/20 p-1 rounded-full active:bg-white/40"><Icon name="x" size={20}/></button>
+                        <Icon name="trophy" size={48} className="mx-auto text-yellow-300 mb-1" />
+                        <h2 className="text-2xl font-bold italic">即時戰果結算</h2>
+                    </div>
+                    <div className="p-6 space-y-4">
+                        <div className="space-y-3">
+                            {players.map((n, i) => (
+                                <div key={i} className="flex justify-between items-center border-b border-slate-50 pb-2">
+                                    <div className="flex items-center gap-2">
+                                        <div className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] text-white font-bold ${totals.scores[i] >= 0 ? 'bg-red-500' : 'bg-blue-500'}`}>{i+1}</div>
+                                        <span className="font-bold text-slate-700">{n}</span>
+                                    </div>
+                                    <span className={`text-xl font-black font-mono ${totals.scores[i]>=0?'text-red-600':'text-blue-600'}`}>{totals.scores[i]>0?`+${totals.scores[i]}`:totals.scores[i]}</span>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="bg-orange-50 p-4 rounded-xl flex justify-between items-center border border-orange-100 shadow-inner">
+                            <div>
+                                <div className="font-bold text-orange-800 flex items-center gap-1"><Icon name="crown" size={14}/>{hostName}</div>
+                                <div className="text-[10px] text-orange-400 font-bold">總累計收底 (東錢)</div>
+                            </div>
+                            <span className="text-xl font-black text-orange-600 font-mono">+{totals.hostTotal}</span>
+                        </div>
+                        <button onClick={onClose} className="w-full py-4 bg-slate-900 text-white rounded-xl font-bold shadow-lg active:scale-95 transition-transform mt-2">返回牌局</button>
+                    </div>
+                </div>
+            </div>
+        );
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
